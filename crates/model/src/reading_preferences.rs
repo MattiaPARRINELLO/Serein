@@ -18,6 +18,15 @@ pub struct ReadingPreferences {
 	pub hide_media_links: bool,
 	pub confirm_external_links: bool,
 }
+/// Ordinary builds keep Discord's 100% default. A local build may raise it at compile time
+/// with `SEREIN_DEFAULT_SCROLL_SPEED`, for example 200, without changing other builds.
+fn default_scroll_speed_percent() -> u16 {
+	option_env!("SEREIN_DEFAULT_SCROLL_SPEED")
+		.and_then(|value| value.parse::<u16>().ok())
+		.filter(|value| (25..=300).contains(value))
+		.unwrap_or(100)
+}
+
 impl Default for ReadingPreferences {
 	fn default() -> Self {
 		Self {
@@ -30,7 +39,7 @@ impl Default for ReadingPreferences {
 			double_click_reaction: 0,
 			animate_gifs: true,
 			smooth_scrolling: true,
-			scroll_speed_percent: 100,
+			scroll_speed_percent: default_scroll_speed_percent(),
 			hide_media_links: true,
 			confirm_external_links: true,
 		}
