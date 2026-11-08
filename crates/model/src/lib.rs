@@ -561,6 +561,10 @@ pub enum Delivery {
 
 pub const MAX_RICH_ACTIVITIES: usize = 4;
 
+/// Widest accepted message body: Nitro accounts may send 4,000 characters. The local archive
+/// reuses this cap instead of defining another message-length limit.
+pub const MAX_MESSAGE_CHARS: usize = 4000;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PresenceStatus {
 	#[default]

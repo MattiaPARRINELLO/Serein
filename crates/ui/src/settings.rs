@@ -33,17 +33,20 @@ enum Page {
 	/// Display language and clock style.
 	LanguageTime,
 	Storage,
+	/// Opt-in archive of messages deleted while they were loaded.
+	DeletedMessages,
 	Updates,
 	Extensions,
 	Themes,
 }
 impl Page {
 	/// Every page in sidebar order; the narrow-window page picker lists them the same way.
-	const ALL: [Self; 15] = [
+	const ALL: [Self; 16] = [
 		Self::Account,
 		Self::Profile,
 		Self::MessagingPermissions,
 		Self::Storage,
+		Self::DeletedMessages,
 		Self::Appearance,
 		Self::Chat,
 		Self::Notifications,
@@ -66,6 +69,7 @@ impl Page {
 				Self::Profile,
 				Self::MessagingPermissions,
 				Self::Storage,
+				Self::DeletedMessages,
 			],
 		),
 		(
@@ -98,6 +102,7 @@ impl Page {
 			Self::Voice => "page-voice",
 			Self::Keybinds => "page-keybinds",
 			Self::Storage => "page-storage",
+			Self::DeletedMessages => "page-deleted-messages",
 			Self::Updates => "page-updates",
 			Self::Extensions => "page-extensions",
 			Self::Themes => "page-themes",
@@ -120,6 +125,7 @@ impl Page {
 			Self::Voice => "description-voice",
 			Self::Keybinds => "description-keybinds",
 			Self::Storage => "description-storage",
+			Self::DeletedMessages => "description-deleted-messages",
 			Self::Updates => "description-updates",
 			Self::Extensions => "description-extensions",
 			Self::Themes => "description-themes",
@@ -157,6 +163,7 @@ impl Page {
 				"language time clock 12 hour 24 hour am pm format locale translation"
 			}
 			Self::Storage => "data privacy local storage clear cache drafts credentials",
+			Self::DeletedMessages => "deleted messages archive sniffer log retention local history",
 			Self::Updates => {
 				"updates auto update release channel production stable nightly download restart version check diagnostics issue bug system info debug"
 			}
@@ -488,6 +495,20 @@ impl MessagingUi {
 										false,
 									),
 									Page::Storage => self.storage_page(ui, state),
+									Page::DeletedMessages => {
+										if self.archive_deleted_messages
+											&& let Some(account) =
+												state.user.as_ref().map(|user| user.id)
+										{
+											self.deleted_messages.ensure_loaded(account);
+										}
+										crate::deleted_messages::page(
+											ui,
+											state,
+											&mut self.deleted_messages,
+											&mut self.archive_deleted_messages,
+										);
+									}
 									Page::Updates => self.update_settings(ui, state.demo),
 									Page::Keybinds => crate::keybinds::show(
 										ui,

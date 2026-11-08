@@ -102,6 +102,14 @@ pub enum Operation {
 		channel: Id,
 		ids: Vec<Id>,
 	},
+	/// Opt-in archive batch captured before the live timeline drops the payload.
+	ArchiveDeletedMessages(Vec<local_store::DeletedMessage>),
+	LoadDeletedMessages {
+		offset: usize,
+		limit: usize,
+		request: u64,
+	},
+	ClearDeletedMessages,
 	ClearHistory,
 	Forget,
 }
@@ -139,6 +147,12 @@ pub enum Outcome {
 		epoch: u64,
 	},
 	Saved,
+	DeletedMessages {
+		request: u64,
+		offset: usize,
+		result: Result<Vec<local_store::DeletedMessage>, StoreError>,
+	},
+	DeletedMessagesCleared(Result<(), StoreError>),
 	HistoryCleared,
 	Failed {
 		error: StoreError,
@@ -250,6 +264,17 @@ impl Cache {
 					return false;
 				}
 				message_bytes(messages)
+			}
+			Operation::ArchiveDeletedMessages(entries) => {
+				if entries.len() > local_store::MAX_DELETED_MESSAGE_PAGE
+					|| entries
+						.iter()
+						.map(local_store::DeletedMessage::bytes)
+						.sum::<usize>() > WINDOW_BYTES
+				{
+					return false;
+				}
+				entries.iter().map(local_store::DeletedMessage::bytes).sum()
 			}
 			Operation::SaveDraft { content, .. } => {
 				if content.len() > 8192 {
@@ -541,6 +566,15 @@ fn execute(
 		Operation::DeleteMessages { .. } => {
 			"Could not remove deleted cached messages; history cache disabled until restart; messages may remain on disk"
 		}
+		Operation::ArchiveDeletedMessages(_) => {
+			"Could not save the deleted-message archive on this device"
+		}
+		Operation::LoadDeletedMessages { .. } => {
+			"Could not read the deleted-message archive on this device"
+		}
+		Operation::ClearDeletedMessages => {
+			"Could not clear the deleted-message archive on this device"
+		}
 		Operation::SaveDraft { .. } => {
 			"Could not save a draft; latest text may exist only in memory"
 		}
@@ -636,6 +670,21 @@ fn execute(
 			Operation::DeleteMessages { channel, ids } => store
 				.delete_messages(account, channel, &ids)
 				.map(|_| Outcome::Saved),
+			Operation::ArchiveDeletedMessages(entries) => store
+				.archive_deleted_messages(account, &entries)
+				.map(|_| Outcome::Saved),
+			Operation::LoadDeletedMessages {
+				offset,
+				limit,
+				request,
+			} => Ok(Outcome::DeletedMessages {
+				request,
+				offset,
+				result: store.deleted_messages(account, offset, limit),
+			}),
+			Operation::ClearDeletedMessages => Ok(Outcome::DeletedMessagesCleared(
+				store.clear_deleted_messages(account),
+			)),
 			Operation::ClearHistory => store
 				.clear_history(account)
 				.map(|_| Outcome::HistoryCleared),

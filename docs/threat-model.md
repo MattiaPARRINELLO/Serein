@@ -25,7 +25,9 @@ Credentials are non-serializable, non-Clone, redacted, zeroized in owned Rust bu
 
 Threats addressed: redirected Authorization leakage, header injection, bot-session substitution, oversized REST/WebSocket input, partial-update corruption, stale session callbacks, uncontrolled queues, automatic ambiguous-write retries, disk account mixing, plaintext-token files without explicit consent and background data collection.
 
-Open risks: unofficial Discord account policy; third-party login page or platform-engine compromise; native dependency supply chain; untested embedded challenge/QR handoff; local users/backups reading unencrypted SQLite; sophisticated permissions/event gaps; incomplete event/subscription coverage; Markdown/font/accessibility coverage; and OS keychain denial/unavailability. No encryption is downgraded for voice; voice is unavailable.
+Open risks: unofficial Discord account policy; third-party login page or platform-engine compromise; native dependency supply chain; untested embedded challenge/QR handoff; local users/backups reading unencrypted SQLite, including the opt-in deleted-message archive; sophisticated permissions/event gaps; incomplete event/subscription coverage; Markdown/font/accessibility coverage; and OS keychain denial/unavailability. No encryption is downgraded for voice; voice is unavailable.
+
+The deleted-message archive is opt-in, local-only and account-isolated. It records only messages that were loaded in the selected conversation when the service announced their deletion, never other channels, and it is purged on logout and explicit cache clearing; disabling the opt-in stops new captures and clears the signed-in account's rows. Archived rows are display-only and cannot authorize replies, edits, reactions or sends. A failed purge is surfaced rather than hidden.
 
 Do not report secrets or raw HTTP/Gateway payloads. Error UI uses fixed categories. Default tests use synthetic markers and local transports. No live network account testing in CI.
 

@@ -157,6 +157,14 @@ and a red hang-up button, a green "In a call" badge in the header, mute/deafen t
 account card, and a "Voice Connected" panel above it while connected. Camera, screen share,
 activities and soundboard are shown disabled: Serein has no such features.
 
+## Deleted messages
+
+Settings › Deleted messages holds the opt-in archive switch and a bounded, paginated list of
+messages deleted while their conversation was loaded. Rows show the author, channel, content,
+attachment names and sent/deleted times; they offer no reply, edit, reaction or send actions.
+The page states the fixed per-account bounds (5,000 rows, 16 MiB, 30 days) and offers Load more
+and Clear archive. When the opt-in is off the list is hidden and existing rows are cleared.
+
 ## Verification notes
 
 Native macOS captures at 1120×760 in Serein dark, Eclipse, Slate, Nightfall and light were

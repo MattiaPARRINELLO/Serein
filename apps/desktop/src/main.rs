@@ -1517,6 +1517,19 @@ fn demo_members(
 	}
 }
 
+/// Storage rows become display-only view entries; no command path can act on them.
+fn archived_entry(row: &local_store::DeletedMessage) -> ui::deleted_messages::Entry {
+	ui::deleted_messages::Entry {
+		channel: row.channel,
+		id: row.id,
+		author_name: row.author_name.clone(),
+		content: row.content.clone(),
+		sent_at: row.sent_at,
+		deleted_at: row.deleted_at,
+		attachments: row.attachments.clone(),
+	}
+}
+
 #[cfg(target_os = "windows")]
 fn align_undecorated_surface(window: &winit::window::Window) {
 	use winit::platform::windows::WindowExtWindows as _;
@@ -3472,6 +3485,35 @@ impl Desktop {
 			}
 			_ => return,
 		};
+		// Snapshot the display payload before the reducer tombstones these IDs.
+		if self.messaging.archive_deleted_messages {
+			let deleted_at = std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.map(|elapsed| elapsed.as_secs() as i64)
+				.unwrap_or(0);
+			let entries: Vec<_> = ids
+				.iter()
+				.filter_map(|id| {
+					self.state
+						.timeline
+						.get_display(*id)
+						.filter(|message| {
+							message.channel == channel && extension_events::public(message)
+						})
+						.map(|message| {
+							local_store::DeletedMessage::from_message(message, deleted_at)
+						})
+				})
+				.collect();
+			if let (Some(cache), false) = (&self.cache, entries.is_empty())
+				&& cache.queue(
+					self.state.generation,
+					account,
+					cache::Operation::ArchiveDeletedMessages(entries),
+				) {
+				self.cache_pending += 1;
+			}
+		}
 		self.delete_cached_ids(channel, ids);
 	}
 	fn delete_cached_ids(&mut self, channel: model::Id, ids: Vec<model::Id>) {
@@ -3488,6 +3530,50 @@ impl Desktop {
 			self.cache_pending += 1;
 		} else {
 			self.request_history_clear(account);
+		}
+	}
+	/// Services the bounded Deleted messages view: one page load or one account purge per frame.
+	fn service_deleted_messages(&mut self) {
+		if self.state.demo || self.fixture_only {
+			self.messaging.deleted_messages.take_request();
+			self.messaging.deleted_messages.clear_requested = false;
+			return;
+		}
+		let Some(account) = self.state.user.as_ref().map(|user| user.id) else {
+			self.messaging.deleted_messages.take_request();
+			self.messaging.deleted_messages.clear_requested = false;
+			return;
+		};
+		let generation = self.state.generation;
+		if std::mem::take(&mut self.messaging.deleted_messages.clear_requested) {
+			let queued = self.cache.as_ref().is_some_and(|cache| {
+				cache.queue(generation, account, cache::Operation::ClearDeletedMessages)
+			});
+			if queued {
+				self.cache_pending += 1;
+			} else {
+				self.messaging.deleted_messages.clear_finished(false);
+			}
+		}
+		if let Some((request, offset)) = self.messaging.deleted_messages.take_request() {
+			let queued = self.cache.as_ref().is_some_and(|cache| {
+				cache.queue(
+					generation,
+					account,
+					cache::Operation::LoadDeletedMessages {
+						offset,
+						limit: local_store::MAX_DELETED_MESSAGE_PAGE,
+						request,
+					},
+				)
+			});
+			if queued {
+				self.cache_pending += 1;
+			} else {
+				self.messaging
+					.deleted_messages
+					.loaded(request, offset, Err(()));
+			}
 		}
 	}
 	/// Dispatches one queued command to the demo or live transport.
@@ -4724,6 +4810,7 @@ impl Desktop {
 							self.messaging.channel_preferences_status = "Local storage worker stopped; restart Serein to restore channel preferences.";
 						}
 						presence_cache_stopped = self.presence_load_pending;
+						self.messaging.deleted_messages.load_failed();
 						break;
 					}
 					Err(std::sync::mpsc::TryRecvError::Empty) => break,
@@ -4879,6 +4966,30 @@ impl Desktop {
 					}
 					continue;
 				}
+				cache::Outcome::DeletedMessages {
+					request,
+					offset,
+					result,
+				} => {
+					if generation == self.state.generation {
+						let result = result
+							.as_ref()
+							.map(|rows| rows.iter().map(archived_entry).collect::<Vec<_>>())
+							.map_err(|_| ());
+						self.messaging
+							.deleted_messages
+							.loaded(*request, *offset, result);
+					}
+					continue;
+				}
+				cache::Outcome::DeletedMessagesCleared(result) => {
+					if generation == self.state.generation {
+						self.messaging
+							.deleted_messages
+							.clear_finished(result.is_ok());
+					}
+					continue;
+				}
 				_ => {}
 			}
 			if generation != self.state.generation {
@@ -4949,6 +5060,8 @@ impl Desktop {
 				| cache::Outcome::ReadingPreferencesSaved(_)
 				| cache::Outcome::Accounts { .. }
 				| cache::Outcome::HistoryCleared
+				| cache::Outcome::DeletedMessages { .. }
+				| cache::Outcome::DeletedMessagesCleared(_)
 				| cache::Outcome::Failed { .. }
 				| cache::Outcome::AccountPresences(_)
 				| cache::Outcome::AccountPresenceSaved(_) => unreachable!(),
@@ -6387,6 +6500,7 @@ impl eframe::App for Desktop {
 				self.messaging.notification_sound_status = "Could not save device notification settings. Changes apply only until restart.";
 			}
 			let mut commands = self.messaging.show(ui, &mut self.state);
+			self.service_deleted_messages();
 			self.extensions.cancel_stale_message_events(&self.state);
 			self.choose_interaction_files(&ctx);
 			if let Some(command) = self.captcha.sync(

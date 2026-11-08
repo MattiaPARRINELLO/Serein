@@ -20,6 +20,7 @@ pub use avatars::media::debug_heic_layout_check;
 pub use avatars::media::{Lane, MAX_FRAMES, Motion, Rendition, Size, fit_edge, is_motion_video};
 pub use avatars::{EFFECT_EDGE, EMBED_EDGE, FRAME_EDGE, GifFrames};
 mod categories;
+pub mod deleted_messages;
 #[cfg(feature = "demo")]
 pub use categories::debug_thread_navigation_check;
 #[cfg(feature = "demo")]
@@ -298,6 +299,9 @@ pub struct MessagingUi {
 	channel_move: Option<(Id, client_core::channel_actions::Action)>,
 	search: search::SearchUi,
 	settings: settings::Settings,
+	/// Opt-in local archive of messages deleted while loaded.
+	pub archive_deleted_messages: bool,
+	pub deleted_messages: deleted_messages::DeletedMessagesUi,
 	server_settings: server_settings::Editor,
 	server_icon_sequence: u64,
 	server_emoji_sequence: u64,

@@ -1,5 +1,31 @@
 # Local storage policy and audit
 
+## Deleted-message archive (November 8, 2026)
+
+Settings › Deleted messages adds an opt-in, account-isolated local archive (schema 30) for
+messages deleted while their conversation is loaded. It is off by default. The desktop snapshots
+the display payload before the reducer tombstones the ID, then queues one bounded archive batch on
+the existing storage worker; the live cache still removes the row from `messages`. A deletion of
+a message that was not loaded, or of more than 100 IDs in one bulk event, is not archived. The
+archive is never injected back into the live timeline and cannot be replied to, edited, reacted
+to or sent from.
+
+Each row stores the account, channel, message and author IDs, the bounded author name and content,
+snowflake-derived sent time, local deletion time and the validated attachment metadata as JSON.
+Content reuses `model::MAX_MESSAGE_CHARS` (4,000 characters); author names are capped at 128
+characters; serialized attachments at 256 KiB. Fixed limits are `MAX_DELETED_MESSAGES` (5,000
+rows), `MAX_DELETED_MESSAGE_BYTES` (16 MiB of content, names and serialized attachments) and
+`DELETED_MESSAGE_RETENTION_SECS` (30 days) per account. Every batch and the startup maintenance
+pass purge expired rows and evict the oldest `deleted_at` rows until both budgets hold, in the
+same transaction. Reads are paginated at `MAX_DELETED_MESSAGE_PAGE` (100 rows) with a bounded
+offset; there is no unbounded `SELECT`.
+
+Every read and write is keyed by account. Logout (`forget_account`) and Clear cache
+(`clear_history`) delete the account's archived rows; turning the opt-in off also clears the
+signed-in account's rows.
+No network request, telemetry, bot API or encryption is added. The archive lives in the existing
+unencrypted SQLite file, so the same local-user and backup exposure described below applies.
+
 ## Typing indicators (October 23, 2026)
 
 Typing stays in session RAM: eight selected-channel typists, sixteen direct-conversation

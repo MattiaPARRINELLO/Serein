@@ -16,7 +16,7 @@ pub fn available(state: &State) -> bool {
 		})
 }
 
-fn public(message: &Message) -> bool {
+pub(crate) fn public(message: &Message) -> bool {
 	!message.ephemeral && message.flags & 64 == 0
 }
 

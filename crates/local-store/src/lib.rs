@@ -11,8 +11,92 @@ use std::{
 
 const MAX_MEDIA_JSON: usize = 256 * 1024;
 const MAX_WINDOW_BYTES: usize = 4 * 1024 * 1024;
-const NATIVE_SCHEMA: u32 = 29;
-const READABLE_SCHEMA: u32 = 29;
+/// Deleted-message archive budgets, fixed for this version and enforced after every batch and
+/// once at startup. Each account is isolated; eviction removes the oldest `deleted_at` first.
+pub const MAX_DELETED_MESSAGES: usize = 5_000;
+pub const MAX_DELETED_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+/// Entries older than thirty days are purged on the next maintenance pass.
+pub const DELETED_MESSAGE_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
+/// One page of the bounded archive view; every read is limited to this many rows.
+pub const MAX_DELETED_MESSAGE_PAGE: usize = 100;
+/// Batches accepted from one gateway deletion event.
+const MAX_DELETED_MESSAGE_BATCH: usize = 100;
+const NATIVE_SCHEMA: u32 = 30;
+const READABLE_SCHEMA: u32 = 30;
+
+/// One locally archived deleted message. Display-only: it never feeds service actions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeletedMessage {
+	pub channel: Id,
+	pub id: Id,
+	pub author: Id,
+	pub author_name: String,
+	pub content: String,
+	pub sent_at: i64,
+	pub deleted_at: i64,
+	pub attachments: Vec<model::Attachment>,
+}
+
+impl DeletedMessage {
+	/// Snapshots the display payload of a message before the reducer drops it.
+	pub fn from_message(message: &Message, deleted_at: i64) -> Self {
+		let author_name = message
+			.author_nick
+			.as_deref()
+			.filter(|name| !name.is_empty())
+			.unwrap_or(&message.author.name);
+		Self {
+			channel: message.channel,
+			id: message.id,
+			author: message.author.id,
+			author_name: author_name.chars().take(128).collect(),
+			content: message
+				.content
+				.chars()
+				.take(model::MAX_MESSAGE_CHARS)
+				.collect(),
+			// Discord snowflakes start at this epoch; the ID is the only sent-time the row keeps.
+			// Stored in Unix seconds, matching `deleted_at`.
+			sent_at: (message.id.0 >> 22)
+				.saturating_div(1_000)
+				.saturating_add(1_420_070_400) as i64,
+			deleted_at,
+			attachments: message.attachments.clone(),
+		}
+	}
+	pub fn bytes(&self) -> usize {
+		std::mem::size_of::<Self>()
+			+ self.author_name.len()
+			+ self.content.len()
+			+ self
+				.attachments
+				.iter()
+				.map(model::Attachment::bytes)
+				.sum::<usize>()
+	}
+	fn attachments_json(&self) -> Result<String> {
+		if !model::valid_attachments(&self.attachments) {
+			return Err(StoreError::Capacity);
+		}
+		let json =
+			serde_json::to_string(&self.attachments).map_err(|_| StoreError::Incompatible)?;
+		if json.len() > MAX_MEDIA_JSON {
+			return Err(StoreError::Capacity);
+		}
+		Ok(json)
+	}
+	fn valid(&self) -> bool {
+		self.channel.0 != 0
+			&& self.id.0 != 0
+			&& self.author.0 != 0
+			&& !self.author_name.is_empty()
+			&& self.author_name.len() <= 512
+			&& self.content.chars().count() <= model::MAX_MESSAGE_CHARS
+			&& self.sent_at >= 0
+			&& self.deleted_at >= 0
+			&& model::valid_attachments(&self.attachments)
+	}
+}
 #[derive(serde::Deserialize)]
 struct CachedMentions(#[serde(deserialize_with = "model::deserialize_mentions")] Vec<User>);
 fn parse_author_roles(raw: &str) -> std::result::Result<Vec<Id>, StoreError> {
@@ -99,6 +183,8 @@ pub struct AppPreferences {
 	pub time_format: model::TimeFormat,
 	/// Owner opt-in: keep saved logins in private plain files when no OS keyring works.
 	pub plaintext_login: bool,
+	/// Owner opt-in: archive messages deleted while they are loaded, locally and account-scoped.
+	pub archive_deleted_messages: bool,
 	/// Owner opt-in diagnostic log; older preferences deserialize with logging off.
 	pub diagnostics_log: diagnostics::Level,
 	/// First-run setup finished or skipped; absent in older preferences, so existing installs
@@ -147,6 +233,7 @@ impl Default for AppPreferences {
 			image_cache: Default::default(),
 			time_format: Default::default(),
 			plaintext_login: false,
+			archive_deleted_messages: false,
 			diagnostics_log: diagnostics::Level::Off,
 			setup_done: false,
 		}
@@ -630,8 +717,28 @@ impl LocalStore {
 		if !has_author_nick {
 			transaction.execute_batch("ALTER TABLE messages ADD COLUMN author_nick TEXT;")?;
 		}
+		// Schema 30: opt-in local archive of messages deleted while loaded. Additive only; the
+		// live message cache keeps its own deletion semantics.
+		transaction.execute_batch(
+			"CREATE TABLE IF NOT EXISTS deleted_messages(
+                account TEXT NOT NULL,
+                channel TEXT NOT NULL,
+                id TEXT NOT NULL,
+                author TEXT NOT NULL,
+                author_name TEXT NOT NULL CHECK(typeof(author_name)='text' AND length(CAST(author_name AS BLOB)) BETWEEN 1 AND 512),
+                content TEXT NOT NULL CHECK(typeof(content)='text' AND length(CAST(content AS BLOB))<=16384),
+                sent_at INTEGER NOT NULL CHECK(typeof(sent_at)='integer' AND sent_at>=0),
+                deleted_at INTEGER NOT NULL CHECK(typeof(deleted_at)='integer' AND deleted_at>=0),
+                attachments TEXT NOT NULL DEFAULT '[]' CHECK(typeof(attachments)='text' AND length(CAST(attachments AS BLOB))<=262144),
+                PRIMARY KEY(account, channel, id)
+            );
+            CREATE INDEX IF NOT EXISTS deleted_messages_by_time
+                ON deleted_messages(account, deleted_at DESC, id DESC);",
+		)?;
 		transaction.commit()?;
-		Ok(Self(connection))
+		let mut store = Self(connection);
+		store.enforce_deleted_budgets(None)?;
+		Ok(store)
 	}
 	pub fn app_preferences(&self) -> Result<AppPreferences> {
 		let value: Option<String> = self.0.query_row(
@@ -1475,6 +1582,10 @@ impl LocalStore {
 			"DELETE FROM history_starts WHERE account=?1",
 			[account.to_string()],
 		)?;
+		transaction.execute(
+			"DELETE FROM deleted_messages WHERE account=?1",
+			[account.to_string()],
+		)?;
 		transaction.commit()?;
 		self.0
 			.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA incremental_vacuum(64);")?;
@@ -1499,6 +1610,144 @@ impl LocalStore {
 		transaction.commit()?;
 		self.0
 			.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA incremental_vacuum(64);")?;
+		Ok(())
+	}
+	/// Archives one bounded batch of deleted payloads for an account, then enforces both budgets
+	/// in the same transaction. Replayed deletions keep their original archived row.
+	pub fn archive_deleted_messages(
+		&mut self,
+		account: Id,
+		entries: &[DeletedMessage],
+	) -> Result<()> {
+		if account.0 == 0
+			|| entries.len() > MAX_DELETED_MESSAGE_BATCH
+			|| entries.iter().any(|entry| !entry.valid())
+		{
+			return Err(StoreError::Capacity);
+		}
+		let transaction = self.0.transaction()?;
+		let account_string = account.to_string();
+		{
+			let mut statement = transaction.prepare_cached(
+				"INSERT INTO deleted_messages(account,channel,id,author,author_name,content,sent_at,deleted_at,attachments)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
+                 ON CONFLICT(account,channel,id) DO NOTHING",
+			)?;
+			for entry in entries {
+				statement.execute(params![
+					account_string,
+					entry.channel.to_string(),
+					entry.id.to_string(),
+					entry.author.to_string(),
+					entry.author_name,
+					entry.content,
+					entry.sent_at,
+					entry.deleted_at,
+					entry.attachments_json()?,
+				])?;
+			}
+		}
+		trim_deleted_messages(&transaction, &account_string)?;
+		transaction.commit()?;
+		Ok(())
+	}
+	/// One bounded page of archived deletions for an account, newest first. Damaged rows are
+	/// skipped rather than failing the whole page.
+	pub fn deleted_messages(
+		&self,
+		account: Id,
+		offset: usize,
+		limit: usize,
+	) -> Result<Vec<DeletedMessage>> {
+		if account.0 == 0
+			|| offset > MAX_DELETED_MESSAGES
+			|| limit == 0
+			|| limit > MAX_DELETED_MESSAGE_PAGE
+		{
+			return Err(StoreError::Capacity);
+		}
+		let mut statement = self.0.prepare_cached(
+			"SELECT channel,id,author,author_name,content,sent_at,deleted_at,attachments
+             FROM deleted_messages WHERE account=?1
+             ORDER BY deleted_at DESC,id DESC LIMIT ?2 OFFSET ?3",
+		)?;
+		let rows = statement.query_map(
+			params![account.to_string(), limit as i64, offset as i64],
+			|row| {
+				Ok((
+					row.get::<_, String>(0)?,
+					row.get::<_, String>(1)?,
+					row.get::<_, String>(2)?,
+					row.get::<_, String>(3)?,
+					row.get::<_, String>(4)?,
+					row.get::<_, i64>(5)?,
+					row.get::<_, i64>(6)?,
+					row.get::<_, String>(7)?,
+				))
+			},
+		)?;
+		let mut messages = Vec::new();
+		for row in rows {
+			let (channel, id, author, author_name, content, sent_at, deleted_at, attachments) =
+				row?;
+			let Ok(channel) = channel.parse::<Id>() else {
+				continue;
+			};
+			let Ok(id) = id.parse::<Id>() else {
+				continue;
+			};
+			let Ok(author) = author.parse::<Id>() else {
+				continue;
+			};
+			let Ok(attachments) = serde_json::from_str::<model::AttachmentList>(&attachments)
+			else {
+				continue;
+			};
+			let message = DeletedMessage {
+				channel,
+				id,
+				author,
+				author_name,
+				content,
+				sent_at,
+				deleted_at,
+				attachments: attachments.0,
+			};
+			if message.valid() {
+				messages.push(message);
+			}
+		}
+		Ok(messages)
+	}
+	/// Removes every archived deletion for one account. Called by explicit clear and logout.
+	pub fn clear_deleted_messages(&mut self, account: Id) -> Result<()> {
+		if account.0 == 0 {
+			return Err(StoreError::Capacity);
+		}
+		self.0.execute(
+			"DELETE FROM deleted_messages WHERE account=?1",
+			[account.to_string()],
+		)?;
+		Ok(())
+	}
+	/// Purges expired rows and enforces both per-account budgets. `None` maintains every account
+	/// once at startup; `Some` is used after an archive batch.
+	fn enforce_deleted_budgets(&mut self, account: Option<Id>) -> Result<()> {
+		let transaction = self.0.transaction()?;
+		let cutoff = unix_now().saturating_sub(DELETED_MESSAGE_RETENTION_SECS);
+		transaction.execute("DELETE FROM deleted_messages WHERE deleted_at<?1", [cutoff])?;
+		let accounts: Vec<String> = if let Some(account) = account {
+			vec![account.to_string()]
+		} else {
+			let mut statement =
+				transaction.prepare("SELECT DISTINCT account FROM deleted_messages")?;
+			let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+			rows.collect::<std::result::Result<_, _>>()?
+		};
+		for account in accounts {
+			trim_deleted_messages(&transaction, &account)?;
+		}
+		transaction.commit()?;
 		Ok(())
 	}
 	/// Saved GIF favorites for one account, newest first. Rejected rows are skipped.
@@ -1657,6 +1906,7 @@ impl LocalStore {
 			"channel_preferences",
 			"account_presence",
 			"accounts",
+			"deleted_messages",
 		] {
 			transaction.execute(
 				&format!("DELETE FROM {table} WHERE account=?1"),
@@ -1669,6 +1919,37 @@ impl LocalStore {
 		Ok(())
 	}
 }
+
+fn unix_now() -> i64 {
+	std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.map(|elapsed| elapsed.as_secs() as i64)
+		.unwrap_or(0)
+}
+
+/// Drops the oldest archived rows until both the item and byte budgets hold for one account.
+/// Runs inside the caller's transaction so every archive batch is bounded when it commits.
+fn trim_deleted_messages(transaction: &rusqlite::Transaction<'_>, account: &str) -> Result<()> {
+	loop {
+		let (count, bytes): (i64, i64) = transaction.query_row(
+			"SELECT count(*), coalesce(sum(length(CAST(content AS BLOB))+length(CAST(author_name AS BLOB))+length(CAST(attachments AS BLOB))),0)
+             FROM deleted_messages WHERE account=?1",
+			[account],
+			|row| Ok((row.get(0)?, row.get(1)?)),
+		)?;
+		if count <= MAX_DELETED_MESSAGES as i64 && bytes <= MAX_DELETED_MESSAGE_BYTES as i64 {
+			return Ok(());
+		}
+		let excess = (count - MAX_DELETED_MESSAGES as i64).clamp(1, 256);
+		transaction.execute(
+			"DELETE FROM deleted_messages WHERE rowid IN (
+                SELECT rowid FROM deleted_messages WHERE account=?1
+                ORDER BY deleted_at ASC,id ASC LIMIT ?2)",
+			params![account, excess],
+		)?;
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	#[test]
@@ -3755,5 +4036,150 @@ impl LocalStore {
 		);
 		assert_eq!(store.reading_preferences().unwrap(), preferences);
 		println!("Double-click reaction migration, roundtrip and bounds passed in memory");
+	}
+}
+
+#[cfg(test)]
+mod deleted_message_tests {
+	use super::*;
+
+	fn archived(id: u64, deleted_at: i64) -> DeletedMessage {
+		DeletedMessage {
+			channel: Id(2),
+			id: Id(id),
+			author: Id(3),
+			author_name: "Synthetic".into(),
+			content: format!("message {id}"),
+			sent_at: 1_700_000_000,
+			deleted_at,
+			attachments: Vec::new(),
+		}
+	}
+
+	#[test]
+	fn deleted_message_archive_migrates_and_stays_account_isolated() {
+		let connection = rusqlite::Connection::open_in_memory().unwrap();
+		connection.execute_batch("PRAGMA user_version=29;").unwrap();
+		let mut store = LocalStore::initialize(connection).unwrap();
+		assert_eq!(
+			store
+				.0
+				.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+				.unwrap(),
+			NATIVE_SCHEMA
+		);
+		let now = unix_now();
+		let first = archived(10, now);
+		store
+			.archive_deleted_messages(Id(1), std::slice::from_ref(&first))
+			.unwrap();
+		store
+			.archive_deleted_messages(Id(9), &[archived(11, now)])
+			.unwrap();
+		assert_eq!(
+			store.deleted_messages(Id(1), 0, 100).unwrap(),
+			vec![first.clone()]
+		);
+		assert_eq!(store.deleted_messages(Id(9), 0, 100).unwrap().len(), 1);
+		assert!(store.deleted_messages(Id(8), 0, 100).unwrap().is_empty());
+		// A replayed deletion keeps one row.
+		store
+			.archive_deleted_messages(Id(1), std::slice::from_ref(&first))
+			.unwrap();
+		assert_eq!(store.deleted_messages(Id(1), 0, 100).unwrap().len(), 1);
+		store.clear_deleted_messages(Id(1)).unwrap();
+		assert!(store.deleted_messages(Id(1), 0, 100).unwrap().is_empty());
+		assert_eq!(store.deleted_messages(Id(9), 0, 100).unwrap().len(), 1);
+		assert_eq!(
+			store.deleted_messages(Id(1), 0, 0),
+			Err(StoreError::Capacity)
+		);
+	}
+
+	#[test]
+	fn deleted_message_archive_purges_expired_entries_and_enforces_budgets() {
+		let connection = rusqlite::Connection::open_in_memory().unwrap();
+		let mut store = LocalStore::initialize(connection).unwrap();
+		let now = unix_now();
+		store
+			.archive_deleted_messages(
+				Id(1),
+				&[
+					archived(1, now - DELETED_MESSAGE_RETENTION_SECS - 1),
+					archived(2, now),
+				],
+			)
+			.unwrap();
+		assert_eq!(store.deleted_messages(Id(1), 0, 100).unwrap().len(), 2);
+		// Reopening runs the startup maintenance pass.
+		let store = LocalStore::initialize(store.0).unwrap();
+		let rows = store.deleted_messages(Id(1), 0, 100).unwrap();
+		assert_eq!(rows.len(), 1);
+		assert_eq!(rows[0].id, Id(2));
+
+		// Count budget: the oldest rows go first.
+		let mut store = store;
+		store.clear_deleted_messages(Id(1)).unwrap();
+		{
+			let transaction = store.0.transaction().unwrap();
+			let mut insert = transaction
+				.prepare("INSERT INTO deleted_messages(account,channel,id,author,author_name,content,sent_at,deleted_at,attachments) VALUES('1','2',?1,'3','Synthetic','x',1,?2,'[]')")
+				.unwrap();
+			for id in 1..=MAX_DELETED_MESSAGES {
+				insert.execute(params![id.to_string(), id as i64]).unwrap();
+			}
+			drop(insert);
+			transaction.commit().unwrap();
+		}
+		store
+			.archive_deleted_messages(Id(1), &[archived(999_999, now)])
+			.unwrap();
+		let count: i64 = store
+			.0
+			.query_row(
+				"SELECT count(*) FROM deleted_messages WHERE account='1'",
+				[],
+				|row| row.get(0),
+			)
+			.unwrap();
+		assert_eq!(count, MAX_DELETED_MESSAGES as i64);
+		let oldest: bool = store
+			.0
+			.query_row(
+				"SELECT EXISTS(SELECT 1 FROM deleted_messages WHERE account='1' AND id='1')",
+				[],
+				|row| row.get(0),
+			)
+			.unwrap();
+		assert!(!oldest);
+
+		// Byte budget: content plus names plus serialized attachments is capped per account.
+		store.clear_deleted_messages(Id(1)).unwrap();
+		let content = "é".repeat(model::MAX_MESSAGE_CHARS);
+		{
+			let transaction = store.0.transaction().unwrap();
+			let mut insert = transaction
+				.prepare("INSERT INTO deleted_messages(account,channel,id,author,author_name,content,sent_at,deleted_at,attachments) VALUES('1','2',?1,'3','Synthetic',?2,1,?3,'[]')")
+				.unwrap();
+			for id in 1..=2100u64 {
+				insert
+					.execute(params![id.to_string(), content, id as i64])
+					.unwrap();
+			}
+			drop(insert);
+			transaction.commit().unwrap();
+		}
+		store
+			.archive_deleted_messages(Id(1), &[archived(999_998, now)])
+			.unwrap();
+		let bytes: i64 = store
+			.0
+			.query_row(
+				"SELECT coalesce(sum(length(CAST(content AS BLOB))+length(CAST(author_name AS BLOB))+length(CAST(attachments AS BLOB))),0) FROM deleted_messages WHERE account='1'",
+				[],
+				|row| row.get(0),
+			)
+			.unwrap();
+		assert!(bytes <= MAX_DELETED_MESSAGE_BYTES as i64);
 	}
 }

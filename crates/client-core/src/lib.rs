@@ -62,7 +62,7 @@ use trail::Place;
 pub const MAX_DRAFT_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_CONTENT: usize = 2000;
 /// Nitro and Nitro Classic accounts may send longer messages.
-pub const MAX_PREMIUM_CONTENT: usize = 4000;
+pub const MAX_PREMIUM_CONTENT: usize = model::MAX_MESSAGE_CHARS;
 /// Discord accepts at most ten attachments per message.
 pub const MAX_ATTACHMENTS: usize = 10;
 pub const MAX_NAV: usize = model::account::MAX_ENTRIES;
