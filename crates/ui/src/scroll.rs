@@ -57,6 +57,55 @@ pub(super) fn instant_wheel_delta(
 }
 /// Chromium / Discord default: 3 wheel lines times 40 px. winit reports one notch as `LineDelta` 1.0.
 pub const DISCORD_LINE_SCROLL_SPEED: f32 = 120.0;
+/// KDE expresses wheel speed in lines; this is Serein's existing pixels-per-line choice.
+const SYSTEM_LINE_HEIGHT: f32 = 40.0;
+
+/// Wheel speed for the current desktop. KDE stores a non-default line count in `kcminputrc`;
+/// other desktops and the default keep Discord's three lines. Touchpad pixel deltas are already
+/// scaled by the system and bypass this conversion. Read once per style application, not per frame.
+pub fn system_line_scroll_speed() -> f32 {
+	#[cfg(target_os = "linux")]
+	if let Some(lines) = kde_scroll_lines() {
+		return (lines * SYSTEM_LINE_HEIGHT).clamp(SYSTEM_LINE_HEIGHT, 4000.0);
+	}
+	DISCORD_LINE_SCROLL_SPEED
+}
+
+#[cfg(target_os = "linux")]
+fn kde_scroll_lines() -> Option<f32> {
+	let root = std::env::var_os("XDG_CONFIG_HOME")
+		.map(std::path::PathBuf::from)
+		.or_else(|| {
+			std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".config"))
+		})?;
+	let text = std::fs::read_to_string(root.join("kcminputrc")).ok()?;
+	parse_kde_scroll_lines(&text)
+}
+
+fn parse_kde_scroll_lines(text: &str) -> Option<f32> {
+	let mut in_mouse = false;
+	for line in text.lines() {
+		let line = line.trim();
+		if let Some(section) = line
+			.strip_prefix('[')
+			.and_then(|line| line.strip_suffix(']'))
+		{
+			in_mouse = section == "Mouse";
+			continue;
+		}
+		if in_mouse
+			&& let Some((key, value)) = line.split_once('=')
+			&& key.trim() == "ScrollLines"
+		{
+			return value
+				.trim()
+				.parse::<f32>()
+				.ok()
+				.filter(|lines| (1.0..=100.0).contains(lines));
+		}
+	}
+	None
+}
 
 /// Chromium's middle-click autoscroll shape (`autoscroll_controller.cc`): a dead zone, then
 /// the full distance from the origin raised to a power. The dead zone is a gate, not subtracted.
@@ -321,4 +370,21 @@ impl Session {
 
 fn clamped_away(requested: f32, current: f32, next: f32) -> bool {
 	(requested - current).abs() > 0.5 && (next - current).signum() == (requested - current).signum()
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn kde_scroll_lines_only_reads_the_mouse_section_and_valid_values() {
+		assert_eq!(
+			parse_kde_scroll_lines("[Mouse]\nScrollLines=6\n"),
+			Some(6.0)
+		);
+		assert_eq!(parse_kde_scroll_lines("[Touchpad]\nScrollLines=9\n"), None);
+		assert_eq!(parse_kde_scroll_lines("[Mouse]\nScrollLines=0\n"), None);
+		assert_eq!(parse_kde_scroll_lines("[Mouse]\nScrollLines=101\n"), None);
+		assert_eq!(parse_kde_scroll_lines(""), None);
+	}
 }

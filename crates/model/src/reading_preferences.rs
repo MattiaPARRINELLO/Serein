@@ -18,13 +18,22 @@ pub struct ReadingPreferences {
 	pub hide_media_links: bool,
 	pub confirm_external_links: bool,
 }
-/// Ordinary builds keep Discord's 100% default. A local build may raise it at compile time
-/// with `SEREIN_DEFAULT_SCROLL_SPEED`, for example 200, without changing other builds.
+/// Ordinary builds keep Discord's 100% default. A local build may override it at compile time
+/// without changing other builds.
 fn default_scroll_speed_percent() -> u16 {
 	option_env!("SEREIN_DEFAULT_SCROLL_SPEED")
 		.and_then(|value| value.parse::<u16>().ok())
 		.filter(|value| (25..=300).contains(value))
 		.unwrap_or(100)
+}
+
+/// Smooth scrolling is an app-side animation; a local build can turn it off by default so raw
+/// system wheel and touchpad deltas pass through unchanged.
+fn default_smooth_scrolling() -> bool {
+	!matches!(
+		option_env!("SEREIN_DEFAULT_SMOOTH_SCROLL"),
+		Some("0" | "off" | "false")
+	)
 }
 
 impl Default for ReadingPreferences {
@@ -38,7 +47,7 @@ impl Default for ReadingPreferences {
 			double_click_reaction_enabled: false,
 			double_click_reaction: 0,
 			animate_gifs: true,
-			smooth_scrolling: true,
+			smooth_scrolling: default_smooth_scrolling(),
 			scroll_speed_percent: default_scroll_speed_percent(),
 			hide_media_links: true,
 			confirm_external_links: true,
